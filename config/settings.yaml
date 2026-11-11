@@ -1,0 +1,91 @@
+# Все настройки сервиса. Правка требует перезапуска. Секреты здесь не хранить (они в .env).
+timezone: Europe/Moscow
+data_dir: data
+log_level: INFO
+
+schedule:
+  active_from: "09:45"        # с этого времени алерты уходят сразу, в это время дайджест
+  stop_at: "22:40"            # сервис завершает работу сам
+  non_working_dates: []       # даты "YYYY-MM-DD", когда сервис не работает (праздники РФ), правит пользователь
+  skip_weekends: true
+
+polling:
+  cycle_interval_sec: 180     # пауза между циклами конвейера (сбор RSS → анализ → проверка)
+  backtest_interval_sec: 3600
+  http_timeout_sec: 20
+
+news:
+  window_hours: 24
+  max_items_per_feed: 40
+  min_fulltext_chars: 500
+  max_fulltext_bytes: 500000
+  cluster_window_hours: 12
+  cluster_similarity: 75
+  user_agent: "TradingAssistantBot/1.0"
+  sources:
+    - {name: interfax,   url: "https://www.interfax.ru/rss.asp",                    fulltext: page, enabled: true}
+    - {name: vedomosti,  url: "https://www.vedomosti.ru/rss/news",                  fulltext: page, enabled: true}
+    - {name: prime,      url: "https://1prime.ru/export/rss2/index.xml",             fulltext: page, enabled: true}
+    - {name: cbr,        url: "https://www.cbr.ru/rss/RssPress",                     fulltext: page, enabled: true}
+    - {name: moex,       url: "https://moex.com/export/news.aspx?cat=100",           fulltext: rss,  enabled: true}
+    - {name: kommersant, url: "https://www.kommersant.ru/RSS/news.xml",              fulltext: page, enabled: false}  # robots.txt запрещает
+    - {name: rbc,        url: "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",    fulltext: page, enabled: false}  # страница отдаёт 401
+    - {name: finam,      url: "https://www.finam.ru/analysis/conews/rsspoint/",       fulltext: page, enabled: false}  # страница отдаёт 403
+    - {name: tass,       url: "https://tass.ru/rss/v2.xml",                          fulltext: page, enabled: false}  # в HTML нет <p>
+
+llm:
+  base_url: "https://openrouter.ai/api/v1"
+  prompt_version: "v2"        # при смене промта меняйте версию: статистика разных версий не смешивается
+  temperature: 0.1
+  max_tokens: 3000            # рассуждения входят в лимит, не уменьшать
+  candidate_budget_share: 0.7 # кандидаты вызываются, пока расход за сутки < 70% daily_budget_usd
+  max_text_chars: 6000        # длина текста новости, уходящая в модель
+  timeout_sec: 60
+  retry_pauses_sec: [1, 30]   # 2 повтора после основного запроса, затем failed
+  concurrency: 2
+  daily_budget_usd: 0.50        # общий лимит в сутки (МСК); пользователь регулирует по статистике расхода
+  # Цены за 1 млн токенов (OpenRouter, 11.11.2026). Боевая пара: две модели РАЗНЫХ разработчиков
+  # близкого уровня, не дороже anthropic/claude-sonnet-5.5.
+  pair:
+    - {id: "anthropic/claude-sonnet-5.5", price_in: 2.0, price_out: 10.0, reasoning_effort: low}
+    - {id: "x-ai/grok-4.7",               price_in: 2.0, price_out: 6.0,  reasoning_effort: low}
+  # Кандидаты на замену (по убыванию стоимости). Тестируются молча (прогнозы пользователю не уходят)
+  # только после признания проекта пригодным, не более candidates_parallel одновременно.
+  # Каждый тест заканчивается после evaluation.sample_n прогнозов модели.
+  candidates_parallel: 2
+  candidates:
+    - {id: "openai/gpt-5.4-mini",             price_in: 0.75,  price_out: 4.5,   reasoning_effort: low}
+    - {id: "deepseek/deepseek-v4-pro",        price_in: 0.892, price_out: 1.785, reasoning_effort: none}
+    - {id: "anthropic/claude-haiku-5.5",      price_in: 0.1,   price_out: 0.5,   reasoning_effort: none}
+    - {id: "openai/gpt-oss-120b",             price_in: 0.15,  price_out: 0.6,   reasoning_effort: low}
+    - {id: "deepseek/deepseek-v4-flash",      price_in: 0.091, price_out: 0.182, reasoning_effort: none}
+    - {id: "google/gemma-4-31b-it:free",      price_in: 0,     price_out: 0}
+    - {id: "nvidia/nemotron-3.5-super-vl:free", price_in: 0,   price_out: 0}
+
+signal:
+  # Модель выдаёт прогноз, только если проходит ВСЕ пороги (лучше меньше прогнозов, но точнее).
+  min_confidence: 85            # самооценка модели; фильтр момента, не критерий пригодности
+  min_severity: 6
+  min_move_pct: 15              # минимальное движение цены в сторону прогноза, %
+  max_horizon_days: 180         # календарных дней; срок меньше — тоже подходит
+  magnitude_tolerance: 0.20     # макс. расхождение величин двух моделей относительно меньшей
+  priority_move_pct: 25         # движение > этого значения — алерт сверх суточного лимита
+  priority_fast_days: 120       # движение >= min_move_pct за срок < этого — алерт сверх лимита
+
+evaluation:
+  sample_n: 100                 # размер теста: проект, пара и каждая модель; пользователь может изменить
+  min_success_pct: 75           # минимум сбывшихся прогнозов для пригодности проекта и модели, %
+
+telegram:
+  antispam_hours: 12            # не обходится ни при каких условиях
+  daily_alert_limit: 5          # обычных алертов в сутки (МСК); приоритетные сверх лимита
+  stat_min_n: 30                # n < 30: «статистики пока мало», цифра не показывается
+  stat_ok_n: 50                 # 30 <= n < 50: цифра «по небольшой выборке»; n >= 50: обычная цифра
+  send_pause_sec: 1
+
+reports:
+  enabled: true
+  daily_time: "09:45"           # ежедневная сводка за прошлые сутки (МСК, рабочие дни)
+  weekly_weekday: 0             # 0 = понедельник
+  weekly_time: "09:45"
+  event_reports: true           # письма о событиях: тест завершён, проект признан/не признан, замена

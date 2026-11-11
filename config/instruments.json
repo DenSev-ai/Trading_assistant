@@ -1,0 +1,14 @@
+[
+  {"ticker": "SBER",  "name": "Сбербанк",        "type": "share", "secid": "SBER",  "board": "TQBR", "market": "shares", "aliases": ["Сбер", "Сбербанк", "Sberbank"], "enabled": true},
+  {"ticker": "LKOH",  "name": "ЛУКОЙЛ",          "type": "share", "secid": "LKOH",  "board": "TQBR", "market": "shares", "aliases": ["Лукойл", "LUKOIL"], "enabled": true},
+  {"ticker": "YDEX",  "name": "Яндекс",          "type": "share", "secid": "YDEX",  "board": "TQBR", "market": "shares", "aliases": ["Яндекс", "Yandex"], "enabled": true},
+  {"ticker": "TATN",  "name": "Татнефть",        "type": "share", "secid": "TATN",  "board": "TQBR", "market": "shares", "aliases": ["Татнефть"], "enabled": true},
+  {"ticker": "T",     "name": "Т-Технологии",    "type": "share", "secid": "T",     "board": "TQBR", "market": "shares", "aliases": ["Т-Технологии", "Т-Банк", "Тинькофф"], "enabled": true},
+  {"ticker": "NVTK",  "name": "Новатэк",         "type": "share", "secid": "NVTK",  "board": "TQBR", "market": "shares", "aliases": ["Новатэк", "НОВАТЭК"], "enabled": true},
+  {"ticker": "OZON",  "name": "Озон",            "type": "share", "secid": "OZON",  "board": "TQBR", "market": "shares", "aliases": ["Озон", "Ozon"], "enabled": true},
+  {"ticker": "TRNFP", "name": "Транснефть (прив.)", "type": "share", "secid": "TRNFP", "board": "TQBR", "market": "shares", "aliases": ["Транснефть"], "enabled": true},
+  {"ticker": "CHMF",  "name": "Северсталь",      "type": "share", "secid": "CHMF",  "board": "TQBR", "market": "shares", "aliases": ["Северсталь"], "enabled": true},
+  {"ticker": "IRAO",  "name": "Интер РАО",       "type": "share", "secid": "IRAO",  "board": "TQBR", "market": "shares", "aliases": ["Интер РАО", "ИнтерРАО"], "enabled": true},
+  {"ticker": "MOEX",  "name": "Московская биржа", "type": "share", "secid": "MOEX", "board": "TQBR", "market": "shares", "aliases": ["Мосбиржа", "Московская биржа"], "enabled": true},
+  {"ticker": "IMOEX", "name": "Индекс МосБиржи", "type": "index", "secid": "IMOEX", "board": "SNDX", "market": "index",  "aliases": ["индекс Мосбиржи", "IMOEX", "российский рынок акций"], "enabled": true}
+]
