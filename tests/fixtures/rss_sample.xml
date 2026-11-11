@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Тестовый источник</title>
+    <item>
+      <title>ЦБ повысил ключевую ставку до 17%</title>
+      <link>https://example.com/news/1</link>
+      <summary>Центробанк России повысил ключевую ставку.</summary>
+      <pubDate>Fri, 06 Nov 2026 12:00:00 +0300</pubDate>
+    </item>
+    <item>
+      <title>Старая новость о погоде</title>
+      <link>https://example.com/news/2</link>
+      <summary>Погода в Москве будет дождливой.</summary>
+      <pubDate>Fri, 30 Oct 2026 12:00:00 +0300</pubDate>
+    </item>
+    <item>
+      <title>Новость без даты</title>
+      <link>https://example.com/news/3</link>
+      <summary>Эта запись не имеет даты публикации.</summary>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Мосбиржа новости</title>
+    <item>
+      <title>Московская биржа запустила новые инструменты</title>
+      <link>https://moex.com/news/1</link>
+      <summary>Новые инструменты на Мосбирже.</summary>
+      <pubDate>Fri, 06 Nov 2026 10:00:00 +0300</pubDate>
+      <content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">
+        <![CDATA[<p>Московская биржа запустила новые инструменты для инвесторов.</p><p>Подробности на сайте.</p>]]>
+      </content:encoded>
+    </item>
+  </channel>
+</rss>
