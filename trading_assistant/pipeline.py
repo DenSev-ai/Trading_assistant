@@ -1,4 +1,4 @@
-"""Конвейеры сбора новостей и анализа кластеров моделями (шаги 2-3)."""
+"""Конвейеры сбора новостей, анализа кластеров и проверки прогнозов (шаги 2-4)."""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from .backtest import evaluate
+from .clock import msk_date, to_iso
 from .config import AppSettings, Keywords, ModelSpec, NewsSource, SignalSettings
 from .instruments import InstrumentRegistry
 from .llm.analyzer import (
@@ -21,6 +23,7 @@ from .llm.analyzer import (
 from .llm.budget import Budget
 from .llm.client import OpenRouterClient
 from .llm.consensus import ConsensusRow, build_consensus, is_issued, make_pair_key
+from .market.moex import MoexClient
 from .news.clustering import find_cluster
 from .news.fulltext import RobotsCache, get_fulltext
 from .news.prefilter import normalize_title, passes_prefilter
@@ -396,4 +399,120 @@ async def analyze_stage(deps: AnalyzeDeps, now: datetime) -> AnalyzeStats:
         await repository.set_cluster_status(cluster_id, "analyzed")
         stats.analyzed += 1
 
+    return stats
+
+
+BASE_PRICE_WINDOW_HOURS = 24
+CANDLES_LOOKBACK_DAYS = 7
+LAST_BACKTEST_KEY = "last_backtest"
+
+
+@dataclass
+class PriceDeps:
+    """Зависимости этапов цены и проверки: клиент MOEX, БД, настройки, реестр, пояс."""
+    moex: MoexClient
+    repository: Repository
+    settings: AppSettings
+    registry: InstrumentRegistry
+    tz: ZoneInfo
+
+
+@dataclass
+class BasePriceStats:
+    """Счётчики этапа базовых цен: просмотрено, записано, без цены, вне реестра."""
+    checked: int = 0
+    priced: int = 0
+    missing: int = 0
+    unknown: int = 0
+
+
+@dataclass
+class BacktestStats:
+    """Счётчики этапа проверки: просмотрено, оценено, ждут срока, вне реестра, пропуск."""
+    checked: int = 0
+    evaluated: int = 0
+    waiting: int = 0
+    unknown: int = 0
+    skipped: bool = False
+
+
+async def base_price_stage(deps: PriceDeps, now: datetime) -> BasePriceStats:
+    """Записать базовые цены выданных прогнозов за сутки; цены нет — оставить NULL."""
+    stats = BasePriceStats()
+    since = now - timedelta(hours=BASE_PRICE_WINDOW_HOURS)
+    rows = await deps.repository.predictions_without_base_price(since)
+    for row in rows:
+        stats.checked += 1
+        instrument = deps.registry.get(row["ticker"])
+        if instrument is None:
+            logger.warning("тикер %s вне реестра: базовая цена не записана", row["ticker"])
+            stats.unknown += 1
+            continue
+        price = await deps.moex.last_price(instrument)
+        if price is None:
+            stats.missing += 1
+            continue
+        await deps.repository.set_base_price(int(row["id"]), price)
+        stats.priced += 1
+    return stats
+
+
+def _elapsed_sec(iso: str, now: datetime) -> float:
+    """Сколько секунд прошло с момента iso (UTC) до now."""
+    moment = datetime.fromisoformat(iso)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return (now - moment).total_seconds()
+
+
+async def backtest_stage(deps: PriceDeps, now: datetime) -> BacktestStats:
+    """Проверить выданные прогнозы по дневным свечам MOEX; не чаще интервала из конфига."""
+    stats = BacktestStats()
+    last = await deps.repository.kv_get(LAST_BACKTEST_KEY)
+    interval = deps.settings.polling.backtest_interval_sec
+    if last is not None and _elapsed_sec(last, now) < interval:
+        stats.skipped = True
+        return stats
+
+    groups: dict[str, list[dict]] = {}
+    for row in await deps.repository.unevaluated_predictions():
+        groups.setdefault(row["ticker"], []).append(row)
+
+    today_msk = now.astimezone(deps.tz).date()
+    for ticker, rows in groups.items():
+        instrument = deps.registry.get(ticker)
+        if instrument is None:
+            logger.warning("тикер %s вне реестра: прогнозы не проверяются", ticker)
+            stats.unknown += len(rows)
+            continue
+        created = [msk_date(row["created_at"], deps.tz) for row in rows]
+        start = min(created) - timedelta(days=CANDLES_LOOKBACK_DAYS)
+        candles = await deps.moex.daily_candles(instrument, start, today_msk)
+        for row, created_msk in zip(rows, created, strict=True):
+            stats.checked += 1
+            result = evaluate(
+                row["direction"],
+                int(row["horizon_days"]),
+                float(row["expected_change_pct"]),
+                created_msk,
+                row["base_price"],
+                candles,
+                today_msk,
+                deps.settings.signal.min_move_pct,
+            )
+            if result is None:
+                stats.waiting += 1
+                continue
+            await deps.repository.set_evaluation(
+                int(row["id"]),
+                result.check_date.isoformat() if result.check_date is not None else None,
+                result.check_price,
+                result.max_move_pct,
+                result.target_hit,
+                result.is_successful,
+                to_iso(now),
+            )
+            stats.evaluated += 1
+
+    await deps.repository.kv_set(LAST_BACKTEST_KEY, to_iso(now))
     return stats

@@ -14,7 +14,16 @@ from .config import EnvSettings, env_checklist, load_keywords, load_settings
 from .db import Database
 from .instruments import InstrumentRegistry
 from .llm.client import OpenRouterClient
-from .pipeline import AnalyzeDeps, CollectDeps, analyze_stage, collect_stage
+from .market.moex import MoexClient
+from .pipeline import (
+    AnalyzeDeps,
+    CollectDeps,
+    PriceDeps,
+    analyze_stage,
+    backtest_stage,
+    base_price_stage,
+    collect_stage,
+)
 from .repository import Repository
 
 PROMPT_PATH = Path("prompts/analyze_news.txt")
@@ -33,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="один цикл (сбор новостей + анализ) и выход (печатает счётчики этапов)",
+        help="один цикл (сбор, анализ, базовые цены, проверка) и выход (печатает счётчики)",
     )
     parser.add_argument(
         "--dry-run",
@@ -93,6 +102,15 @@ def _run_once(dry_run: bool) -> int:
                 tz=tz,
             )
             analyzed = await analyze_stage(analyze_deps, now)
+            price_deps = PriceDeps(
+                moex=MoexClient(http),
+                repository=repo,
+                settings=settings,
+                registry=registry,
+                tz=tz,
+            )
+            priced = await base_price_stage(price_deps, now)
+            checked = await backtest_stage(price_deps, now)
         await db.close()
         print(
             f"собрано={collected.fetched}, дубли={collected.duplicates}, "
@@ -104,6 +122,11 @@ def _run_once(dry_run: bool) -> int:
             f"выданных прогнозов={analyzed.issued_rows}, консенсус={analyzed.consensus_rows}, "
             f"отложено из-за бюджета={analyzed.skipped_budget}, "
             f"расход=${analyzed.cost_usd:.4f}"
+        )
+        print(
+            f"базовые цены={priced.priced} из {priced.checked}, "
+            f"проверено прогнозов={checked.evaluated} из {checked.checked}, "
+            f"ждут срока={checked.waiting}, пропуск по интервалу={checked.skipped}"
         )
         if dry_run:
             print("режим --dry-run: отправка сообщений отключена")

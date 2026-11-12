@@ -199,6 +199,55 @@ class Repository:
             (status, cluster_id),
         )
 
+    async def predictions_without_base_price(self, since: datetime) -> list[dict]:
+        """Выданные прогнозы без базовой цены, созданные не раньше since."""
+        return await self._db.fetchall(
+            "SELECT id, ticker, created_at FROM predictions "
+            "WHERE is_issued = 1 AND base_price IS NULL AND created_at >= ? "
+            "ORDER BY created_at, id",
+            (to_iso(since),),
+        )
+
+    async def set_base_price(self, prediction_id: int, price: float) -> None:
+        """Записать базовую цену прогноза."""
+        await self._db.execute(
+            "UPDATE predictions SET base_price = ? WHERE id = ?",
+            (price, prediction_id),
+        )
+
+    async def unevaluated_predictions(self) -> list[dict]:
+        """Выданные прогнозы, проверка которых ещё не завершена (evaluated_at IS NULL)."""
+        return await self._db.fetchall(
+            "SELECT id, ticker, direction, horizon_days, expected_change_pct, base_price, "
+            "created_at FROM predictions WHERE is_issued = 1 AND evaluated_at IS NULL "
+            "ORDER BY created_at, id"
+        )
+
+    async def set_evaluation(
+        self,
+        prediction_id: int,
+        check_date: str | None,
+        check_price: float | None,
+        max_move_pct: float | None,
+        target_hit: int | None,
+        is_successful: int | None,
+        evaluated_at: str,
+    ) -> None:
+        """Записать результат проверки прогноза (check_date — ISO-дата или None)."""
+        await self._db.execute(
+            "UPDATE predictions SET check_date = ?, check_price = ?, max_move_pct = ?, "
+            "target_hit = ?, is_successful = ?, evaluated_at = ? WHERE id = ?",
+            (
+                check_date,
+                check_price,
+                max_move_pct,
+                target_hit,
+                is_successful,
+                evaluated_at,
+                prediction_id,
+            ),
+        )
+
     async def subjects_with_done_test(self, prompt_version: str) -> set[str]:
         """Модели, чей тест уже завершён (model_tests.status='done') для этой версии промта."""
         rows = await self._db.fetchall(
