@@ -1,4 +1,4 @@
-"""Репозиторий статей и кластеров (все SQL здесь, не в pipeline)."""
+"""Репозиторий статей, кластеров и расходов на модели (все SQL здесь, не в pipeline)."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -84,3 +84,11 @@ class Repository:
             "WHERE id = ?",
             (sources_count, to_iso(now), main_article_id, cluster_id),
         )
+
+    async def spent_since(self, since_utc: datetime) -> float:
+        """Сумма model_runs.cost_usd за запросы не раньше since_utc (UTC)."""
+        row = await self._db.fetchone(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM model_runs WHERE created_at >= ?",
+            (to_iso(since_utc),),
+        )
+        return float(row["total"]) if row else 0.0
