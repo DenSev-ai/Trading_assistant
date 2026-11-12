@@ -22,6 +22,11 @@ class ConsensusRow:
     reason: str
 
 
+def make_pair_key(ids: list[str]) -> str:
+    """Ключ пары моделей: их id по алфавиту через '+', например 'a+x'."""
+    return "+".join(sorted(ids))
+
+
 def is_issued(item: LLMInstrument, severity: int, signal: SignalSettings) -> bool:
     """Прошёл ли прогноз модели ВСЕ пороги выдачи (CONTRACTS §5)."""
     return (

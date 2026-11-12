@@ -5,11 +5,19 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import httpx
 
 from .clock import SystemClock
 from .config import EnvSettings, env_checklist, load_keywords, load_settings
 from .db import Database
-from .pipeline import CollectDeps, collect_stage
+from .instruments import InstrumentRegistry
+from .llm.client import OpenRouterClient
+from .pipeline import AnalyzeDeps, CollectDeps, analyze_stage, collect_stage
+from .repository import Repository
+
+PROMPT_PATH = Path("prompts/analyze_news.txt")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,7 +33,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="один цикл сбора новостей и выход (печатает счётчики этапов)",
+        help="один цикл (сбор новостей + анализ) и выход (печатает счётчики этапов)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="не отправлять сообщения в Telegram (на этом шаге отправки нет)",
     )
     args = parser.parse_args(argv)
 
@@ -37,40 +50,63 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if ok else 1
 
     if args.once:
-        return _run_once()
+        return _run_once(dry_run=args.dry_run)
 
     parser.print_help()
     return 0
 
 
-def _run_once() -> int:
-    """Один цикл сбора новостей с печатью счётчиков."""
+def _run_once(dry_run: bool) -> int:
+    """Один цикл сбора новостей и анализа кластеров с печатью счётчиков."""
     settings = load_settings()
     keywords = load_keywords(Path("config/keywords.yaml"))
+    registry = InstrumentRegistry.load(Path("config/instruments.json"))
+    env = EnvSettings()
+    template = PROMPT_PATH.read_text(encoding="utf-8")
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
+    tz = ZoneInfo(settings.timezone)
     db = Database(str(data_dir / "trading.db"))
 
     async def run() -> int:
         await db.init()
-        from .repository import Repository
-
         repo = Repository(db)
-        import httpx
-
+        now = SystemClock().now()
         async with httpx.AsyncClient(
             timeout=settings.polling.http_timeout_sec,
             headers={"User-Agent": settings.news.user_agent},
             follow_redirects=True,
-        ) as client:
-            deps = CollectDeps(client=client, repository=repo, settings=settings, keywords=keywords)
-            stats = await collect_stage(deps, SystemClock().now())
+        ) as http:
+            collect_deps = CollectDeps(
+                client=http, repository=repo, settings=settings, keywords=keywords
+            )
+            collected = await collect_stage(collect_deps, now)
+            llm = OpenRouterClient(
+                http, env.OPENROUTER_API_KEY, settings.llm.base_url, settings.llm.timeout_sec
+            )
+            analyze_deps = AnalyzeDeps(
+                client=llm,
+                repository=repo,
+                settings=settings,
+                registry=registry,
+                prompt_template=template,
+                tz=tz,
+            )
+            analyzed = await analyze_stage(analyze_deps, now)
         await db.close()
         print(
-            f"собрано={stats.fetched}, дубли={stats.duplicates}, отфильтровано={stats.filtered}, "
-            f"без полного текста={stats.no_fulltext}, в кластеры={stats.clustered}, "
-            f"новые кластеры={stats.new_clusters}"
+            f"собрано={collected.fetched}, дубли={collected.duplicates}, "
+            f"отфильтровано={collected.filtered}, без полного текста={collected.no_fulltext}, "
+            f"в кластеры={collected.clustered}, новые кластеры={collected.new_clusters}"
         )
+        print(
+            f"проанализировано={analyzed.analyzed}, сбоев={analyzed.failed}, "
+            f"выданных прогнозов={analyzed.issued_rows}, консенсус={analyzed.consensus_rows}, "
+            f"отложено из-за бюджета={analyzed.skipped_budget}, "
+            f"расход=${analyzed.cost_usd:.4f}"
+        )
+        if dry_run:
+            print("режим --dry-run: отправка сообщений отключена")
         return 0
 
     return asyncio.run(run())
