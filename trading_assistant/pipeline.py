@@ -397,7 +397,3 @@ async def analyze_stage(deps: AnalyzeDeps, now: datetime) -> AnalyzeStats:
         stats.analyzed += 1
 
     return stats
-
-
-
-

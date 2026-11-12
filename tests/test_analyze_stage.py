@@ -414,6 +414,3 @@ async def test_old_cluster_not_analyzed(db, registry) -> None:
 
 def test_make_pair_key_sorts_ids() -> None:
     assert make_pair_key(["x-ai/b", "anthropic/a"]) == "anthropic/a+x-ai/b"
-
-
-
