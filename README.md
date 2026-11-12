@@ -29,4 +29,23 @@ copy .env.example .env
   .venv\Scripts\python.exe -m ruff check .
   ```
 
-Запуск сервиса: `python -m trading_assistant` из корня репозитория (остальные флаги реализуются на siguientes шагах).
+Запуск сервиса: `python -m trading_assistant` из корня репозитория. Для одного цикла
+используйте `--once`, для работы в нерабочий день — `--force`, для проверки без
+отправки в Telegram — `--dry-run`. `--report` выводит статистику без сетевых запросов.
+
+## Автозапуск
+
+Из корня проекта установите или удалите задачу планировщика Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_task.ps1
+powershell -ExecutionPolicy Bypass -File scripts\uninstall_task.ps1
+```
+
+Задача `TradingAssistant` запускается по будням в 07:45 и может пробуждать компьютер.
+В параметрах текущей схемы электропитания Windows откройте дополнительные параметры,
+раздел «Сон» → «Разрешить таймеры пробуждения» и включите их для нужного режима питания.
+Для ручной проверки выполните `Start-ScheduledTask -TaskName TradingAssistant`.
+Смотрите журнал `data\app.log` и ошибки `data\errors.log`. Сервис самостоятельно
+останавливается в 22:40 по московскому времени; второй экземпляр не запускается из-за
+блокировки `data\service.lock`. Для остановки можно создать файл `data\stop.flag`.

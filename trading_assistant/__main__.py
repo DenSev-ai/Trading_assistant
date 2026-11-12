@@ -1,4 +1,4 @@
-"""Точка входа: `python -m trading_assistant --check-config` / `--once`."""
+"""Точка входа сервиса: длительная работа, `--once`, `--check-config`, `--report`."""
 from __future__ import annotations
 
 import argparse
@@ -34,11 +34,15 @@ from .pipeline import (
     dispatch_stage,
     reports_stage,
 )
+from .platform_win import AlreadyRunning, SingleInstance
 from .reports.mailer import file_mailer, make_mailer, reports_dir
 from .reports.reports import DAILY, WEEKLY, ReportService
 from .repository import Repository
+from .runner import CycleReport, Deps, Runner
 from .stats import Stats
+from .telegram.bot import TradingBot
 from .telegram.dispatcher import BotNotifier, Dispatcher, LogNotifier, Notifier
+from .telegram.health import HealthMonitor
 
 PROMPT_PATH = Path("prompts/analyze_news.txt")
 
@@ -56,7 +60,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="один цикл (сбор, анализ, базовые цены, проверка) и выход (печатает счётчики)",
+        help="один цикл (сбор, анализ, цены, доставка, отчёты) и выход без проверок расписания",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="игнорировать проверку рабочего дня и фазы расписания при старте",
     )
     parser.add_argument(
         "--dry-run",
@@ -88,11 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.send_report:
         return _send_report(args.send_report)
 
-    if args.once:
-        return _run_once(dry_run=args.dry_run)
-
-    parser.print_help()
-    return 0
+    return _run_service(once=args.once, force=args.force, dry_run=args.dry_run)
 
 
 def _print_report() -> int:
@@ -196,8 +201,8 @@ def _log_level(name: str) -> int:
     return getattr(logging, name.upper(), logging.INFO)
 
 
-def _run_once(dry_run: bool) -> int:
-    """Один цикл сбора, анализа, проверки и доставки с печатью счётчиков."""
+def _run_service(once: bool, force: bool, dry_run: bool) -> int:
+    """Работа сервиса по расписанию; --once — один цикл с печатью счётчиков."""
     settings = load_settings()
     keywords = load_keywords(Path("config/keywords.yaml"))
     registry = InstrumentRegistry.load(Path("config/instruments.json"))
@@ -209,47 +214,15 @@ def _run_once(dry_run: bool) -> int:
     tz = ZoneInfo(settings.timezone)
     db = Database(str(data_dir / "trading.db"))
     chat_ids = _chat_ids(env.TELEGRAM_CHAT_IDS)
-    notifier = _notifier(env, chat_ids, dry_run)
+    clock = SystemClock()
 
     async def run() -> int:
-        await db.init()
-        repo = Repository(db)
-        now = SystemClock().now()
-        stats = Stats(repo, settings.signal, settings.evaluation, lambda: now)
-        evaluator = Evaluator(repo, stats, settings, lambda: now)
-        service = _report_service(settings, env, repo, stats, evaluator, lambda: now)
-        async with httpx.AsyncClient(
-            timeout=settings.polling.http_timeout_sec,
-            headers={"User-Agent": settings.news.user_agent},
-            follow_redirects=True,
-        ) as http:
-            collect_deps = CollectDeps(
-                client=http, repository=repo, settings=settings, keywords=keywords
-            )
-            collected = await collect_stage(collect_deps, now)
-            llm = OpenRouterClient(
-                http, env.OPENROUTER_API_KEY, settings.llm.base_url, settings.llm.timeout_sec
-            )
-            analyze_deps = AnalyzeDeps(
-                client=llm,
-                repository=repo,
-                settings=settings,
-                registry=registry,
-                prompt_template=template,
-                tz=tz,
-                reports=service,
-            )
-            analyzed = await analyze_stage(analyze_deps, now)
-            price_deps = PriceDeps(
-                moex=MoexClient(http),
-                repository=repo,
-                settings=settings,
-                registry=registry,
-                tz=tz,
-                reports=service,
-            )
-            priced = await base_price_stage(price_deps, now)
-            checked = await backtest_stage(price_deps, now)
+        with SingleInstance(data_dir / "service.lock"):
+            repo = Repository(db)
+            stats = Stats(repo, settings.signal, settings.evaluation, clock.now)
+            evaluator = Evaluator(repo, stats, settings, clock.now)
+            service = _report_service(settings, env, repo, stats, evaluator, clock.now)
+            notifier = _notifier(env, chat_ids, dry_run)
             dispatcher = Dispatcher(
                 repo,
                 stats,
@@ -263,39 +236,144 @@ def _run_once(dry_run: bool) -> int:
                 prompt_version=settings.llm.prompt_version,
                 record_deliveries=not dry_run,
             )
-            dispatched = await dispatch_stage(DispatchDeps(dispatcher, settings, tz), now)
-            sent = await reports_stage(ReportsDeps(service=service), now)
-        if isinstance(notifier, BotNotifier):
-            await notifier.close()
-        await db.close()
-        print(
-            f"собрано={collected.fetched}, дубли={collected.duplicates}, "
-            f"отфильтровано={collected.filtered}, без полного текста={collected.no_fulltext}, "
-            f"в кластеры={collected.clustered}, новые кластеры={collected.new_clusters}"
-        )
-        print(
-            f"проанализировано={analyzed.analyzed}, сбоев={analyzed.failed}, "
-            f"выданных прогнозов={analyzed.issued_rows}, консенсус={analyzed.consensus_rows}, "
-            f"отложено из-за бюджета={analyzed.skipped_budget}, "
-            f"расход=${analyzed.cost_usd:.4f}"
-        )
-        print(
-            f"базовые цены={priced.priced} из {priced.checked}, "
-            f"проверено прогнозов={checked.evaluated} из {checked.checked}, "
-            f"ждут срока={checked.waiting}, пропуск по интервалу={checked.skipped}"
-        )
-        print(
-            f"доставка: алертов={dispatched.alerts}, "
-            f"подавлено анти-спамом={dispatched.suppressed}, "
-            f"в дайджест={dispatched.queued}, сообщений дайджеста={dispatched.digest_messages}, "
-            f"ошибок доставки={dispatched.errors}"
-        )
-        print(f"отчёты: {', '.join(sent) if sent else 'нет'}")
-        if dry_run:
-            print("режим --dry-run: сообщения в лог, deliveries не пишутся")
-        return 0
+            http = httpx.AsyncClient(
+                timeout=settings.polling.http_timeout_sec,
+                headers={"User-Agent": settings.news.user_agent},
+                follow_redirects=True,
+            )
+            collect_deps = CollectDeps(
+                client=http, repository=repo, settings=settings, keywords=keywords
+            )
+            llm = OpenRouterClient(
+                http, env.OPENROUTER_API_KEY, settings.llm.base_url, settings.llm.timeout_sec
+            )
+            analyze_deps = AnalyzeDeps(
+                client=llm,
+                repository=repo,
+                settings=settings,
+                registry=registry,
+                prompt_template=template,
+                tz=tz,
+                reports=service,
+            )
+            price_deps = PriceDeps(
+                moex=MoexClient(http),
+                repository=repo,
+                settings=settings,
+                registry=registry,
+                tz=tz,
+                reports=service,
+            )
+            health = HealthMonitor(repo, notifier, chat_ids, settings, tz)
+            bot = _trading_bot(
+                dispatcher, repo, stats, settings, tz, chat_ids, env, clock.now, dry_run
+            )
+            deps = Deps(
+                db=db,
+                repository=repo,
+                settings=settings,
+                tz=tz,
+                data_dir=data_dir,
+                collect=lambda now: collect_stage(collect_deps, now),
+                analyze=lambda now: analyze_stage(analyze_deps, now),
+                base_price=lambda now: base_price_stage(price_deps, now),
+                backtest=lambda now: backtest_stage(price_deps, now),
+                dispatch=lambda now: dispatch_stage(DispatchDeps(dispatcher, settings, tz), now),
+                reports=lambda now: reports_stage(ReportsDeps(service=service), now),
+                health=health.check,
+                bot=bot,
+                http=http,
+                close_notifier=notifier.close if isinstance(notifier, BotNotifier) else None,
+            )
+            runner = Runner(deps, clock, once=once, force=force)
+            code = await runner.run()
+            if once:
+                _print_counts(runner.last_report)
+            return code
 
-    return asyncio.run(run())
+    try:
+        return asyncio.run(run())
+    except AlreadyRunning as exc:
+        print(f"[!] {exc}")
+        return 1
+
+
+def _trading_bot(
+    dispatcher: Dispatcher,
+    repo: Repository,
+    stats: Stats,
+    settings: AppSettings,
+    tz: ZoneInfo,
+    chat_ids: list[int],
+    env: EnvSettings,
+    now_fn: Callable[[], datetime],
+    dry_run: bool,
+) -> TradingBot | None:
+    """Бот команд при настроенном Telegram; без токена, chat_id или в --dry-run — None."""
+    if dry_run or not env.TELEGRAM_BOT_TOKEN or not chat_ids:
+        return None
+    try:
+        return TradingBot(
+            dispatcher,
+            repo,
+            stats,
+            chat_ids,
+            settings=settings,
+            tz=tz,
+            now_fn=now_fn,
+            token=env.TELEGRAM_BOT_TOKEN,
+        )
+    except Exception as exc:  # некорректный токен не должен останавливать сервис
+        print(f"[!] Telegram-бот команд не создан ({type(exc).__name__}); команды недоступны")
+        return None
+
+
+def _value(report: CycleReport, stage: str, name: str) -> object:
+    """Поле счётчиков этапа из отчёта цикла; пропущенный этап даёт 0."""
+    result = report.results.get(stage)
+    return getattr(result, name, 0) if result is not None else 0
+
+
+def _print_counts(report: CycleReport | None) -> None:
+    """Напечатать счётчики одного цикла (--once) и этапы, завершившиеся ошибкой."""
+    if report is None:
+        print("цикл не выполнялся")
+        return
+    print(
+        f"собрано={_value(report, 'collect', 'fetched')}, "
+        f"дубли={_value(report, 'collect', 'duplicates')}, "
+        f"отфильтровано={_value(report, 'collect', 'filtered')}, "
+        f"без полного текста={_value(report, 'collect', 'no_fulltext')}, "
+        f"в кластеры={_value(report, 'collect', 'clustered')}, "
+        f"новые кластеры={_value(report, 'collect', 'new_clusters')}"
+    )
+    print(
+        f"проанализировано={_value(report, 'analyze', 'analyzed')}, "
+        f"сбоев={_value(report, 'analyze', 'failed')}, "
+        f"выданных прогнозов={_value(report, 'analyze', 'issued_rows')}, "
+        f"консенсус={_value(report, 'analyze', 'consensus_rows')}, "
+        f"отложено из-за бюджета={_value(report, 'analyze', 'skipped_budget')}, "
+        f"расход=${float(_value(report, 'analyze', 'cost_usd')):.4f}"
+    )
+    print(
+        f"базовые цены={_value(report, 'base_price', 'priced')} "
+        f"из {_value(report, 'base_price', 'checked')}, "
+        f"проверено прогнозов={_value(report, 'backtest', 'evaluated')} "
+        f"из {_value(report, 'backtest', 'checked')}, "
+        f"ждут срока={_value(report, 'backtest', 'waiting')}, "
+        f"пропуск по интервалу={_value(report, 'backtest', 'skipped')}"
+    )
+    print(
+        f"доставка: алертов={_value(report, 'dispatch', 'alerts')}, "
+        f"подавлено анти-спамом={_value(report, 'dispatch', 'suppressed')}, "
+        f"в дайджест={_value(report, 'dispatch', 'queued')}, "
+        f"сообщений дайджеста={_value(report, 'dispatch', 'digest_messages')}, "
+        f"ошибок доставки={_value(report, 'dispatch', 'errors')}"
+    )
+    sent = report.results.get("reports")
+    names = ", ".join(sent) if isinstance(sent, list) and sent else "нет"
+    print(f"отчёты: {names}")
+    print(f"этапы с ошибками: {', '.join(report.errors) if report.errors else 'нет'}")
 
 
 if __name__ == "__main__":
