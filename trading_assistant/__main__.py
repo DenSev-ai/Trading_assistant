@@ -4,14 +4,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
 
 from .clock import SystemClock
-from .config import EnvSettings, env_checklist, load_keywords, load_settings
+from .config import AppSettings, EnvSettings, env_checklist, load_keywords, load_settings
 from .db import Database
+from .evaluation import Evaluator
 from .instruments import InstrumentRegistry
 from .llm.client import OpenRouterClient
 from .market.moex import MoexClient
@@ -19,11 +22,15 @@ from .pipeline import (
     AnalyzeDeps,
     CollectDeps,
     PriceDeps,
+    ReportsDeps,
     analyze_stage,
     backtest_stage,
     base_price_stage,
     collect_stage,
+    reports_stage,
 )
+from .reports.mailer import file_mailer, make_mailer, reports_dir
+from .reports.reports import DAILY, WEEKLY, ReportService
 from .repository import Repository
 from .stats import Stats
 
@@ -55,6 +62,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="напечатать статистику проекта и моделей (состояние, таблица тестов, вердикт)",
     )
+    parser.add_argument(
+        "--send-report",
+        choices=[DAILY, WEEKLY],
+        help="собрать и отправить отчёт daily|weekly прямо сейчас (файл пишется всегда)",
+    )
     args = parser.parse_args(argv)
 
     if args.check_config:
@@ -66,6 +78,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.report:
         return _print_report()
+
+    if args.send_report:
+        return _send_report(args.send_report)
 
     if args.once:
         return _run_once(dry_run=args.dry_run)
@@ -94,6 +109,55 @@ def _print_report() -> int:
     return asyncio.run(run())
 
 
+def _report_service(
+    settings: AppSettings,
+    env: EnvSettings,
+    repo: Repository,
+    stats: Stats,
+    evaluator: Evaluator,
+    now_fn: Callable[[], datetime],
+) -> ReportService:
+    """Собрать сервис отчётов: файл в data/reports всегда, письмо — если настроен SMTP."""
+    return ReportService(
+        repo,
+        stats,
+        evaluator,
+        settings,
+        make_mailer(env, settings, now_fn),
+        file_mailer(settings, now_fn),
+        now_fn,
+    )
+
+
+def _send_report(kind: str) -> int:
+    """Собрать и отправить отчёт указанного вида прямо сейчас (--send-report daily|weekly)."""
+    settings = load_settings()
+    env = EnvSettings()
+    data_dir = Path(settings.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db = Database(str(data_dir / "trading.db"))
+    clock = SystemClock()
+
+    async def run() -> int:
+        await db.init()
+        try:
+            repo = Repository(db)
+            stats = Stats(repo, settings.signal, settings.evaluation, clock.now)
+            evaluator = Evaluator(repo, stats, settings, clock.now)
+            service = _report_service(settings, env, repo, stats, evaluator, clock.now)
+            sent = await service.run(clock.now(), force=kind)
+        finally:
+            await db.close()
+        if not sent:
+            print("отчёт не отправлен: проверьте reports.enabled в config/settings.yaml")
+            return 1
+        for name in sent:
+            print(f"отчёт {name} сохранён в {reports_dir(settings)}")
+        return 0
+
+    return asyncio.run(run())
+
+
 def _run_once(dry_run: bool) -> int:
     """Один цикл сбора новостей и анализа кластеров с печатью счётчиков."""
     settings = load_settings()
@@ -110,6 +174,9 @@ def _run_once(dry_run: bool) -> int:
         await db.init()
         repo = Repository(db)
         now = SystemClock().now()
+        stats = Stats(repo, settings.signal, settings.evaluation, lambda: now)
+        evaluator = Evaluator(repo, stats, settings, lambda: now)
+        service = _report_service(settings, env, repo, stats, evaluator, lambda: now)
         async with httpx.AsyncClient(
             timeout=settings.polling.http_timeout_sec,
             headers={"User-Agent": settings.news.user_agent},
@@ -129,6 +196,7 @@ def _run_once(dry_run: bool) -> int:
                 registry=registry,
                 prompt_template=template,
                 tz=tz,
+                reports=service,
             )
             analyzed = await analyze_stage(analyze_deps, now)
             price_deps = PriceDeps(
@@ -137,9 +205,11 @@ def _run_once(dry_run: bool) -> int:
                 settings=settings,
                 registry=registry,
                 tz=tz,
+                reports=service,
             )
             priced = await base_price_stage(price_deps, now)
             checked = await backtest_stage(price_deps, now)
+            sent = await reports_stage(ReportsDeps(service=service), now)
         await db.close()
         print(
             f"собрано={collected.fetched}, дубли={collected.duplicates}, "
@@ -157,6 +227,7 @@ def _run_once(dry_run: bool) -> int:
             f"проверено прогнозов={checked.evaluated} из {checked.checked}, "
             f"ждут срока={checked.waiting}, пропуск по интервалу={checked.skipped}"
         )
+        print(f"отчёты: {', '.join(sent) if sent else 'нет'}")
         if dry_run:
             print("режим --dry-run: отправка сообщений отключена")
         return 0

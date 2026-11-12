@@ -414,3 +414,75 @@ class Repository:
             (to_iso(since_utc),),
         )
         return float(row["total"]) if row else 0.0
+
+    async def spent_between(self, since: datetime, until: datetime) -> float:
+        """Сумма model_runs.cost_usd за запросы в интервале [since, until)."""
+        row = await self._db.fetchone(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM model_runs "
+            "WHERE created_at >= ? AND created_at < ?",
+            (to_iso(since), to_iso(until)),
+        )
+        return float(row["total"]) if row else 0.0
+
+    async def total_spent(self) -> float:
+        """Весь расход на вызовы моделей за всё время."""
+        row = await self._db.fetchone(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM model_runs"
+        )
+        return float(row["total"]) if row else 0.0
+
+    async def activity_counts(self, since: datetime, until: datetime) -> dict:
+        """Счётчики за интервал [since, until): статьи, кластеры, прогнозы, доставки."""
+        window = (to_iso(since), to_iso(until))
+        articles = await self._db.fetchone(
+            "SELECT COUNT(*) AS collected, COALESCE(SUM(status = 'filtered'), 0) AS filtered "
+            "FROM articles WHERE fetched_at >= ? AND fetched_at < ?",
+            window,
+        )
+        clusters = await self._db.fetchone(
+            "SELECT COUNT(*) AS clusters, COALESCE(SUM(status = 'analyzed'), 0) AS analyzed "
+            "FROM clusters WHERE created_at >= ? AND created_at < ?",
+            window,
+        )
+        predictions = await self._db.fetchone(
+            "SELECT COALESCE(SUM(model <> 'consensus' AND is_issued = 1), 0) AS issued, "
+            "COALESCE(SUM(model = 'consensus'), 0) AS consensus FROM predictions "
+            "WHERE created_at >= ? AND created_at < ?",
+            window,
+        )
+        deliveries = await self._db.fetchone(
+            "SELECT COALESCE(SUM(status = 'alert'), 0) AS alerts, "
+            "COALESCE(SUM(status = 'digest'), 0) AS digest FROM deliveries "
+            "WHERE sent_at >= ? AND sent_at < ?",
+            window,
+        )
+        counts: dict[str, int] = {}
+        for row in (articles, clusters, predictions, deliveries):
+            if row is not None:
+                counts.update({key: int(value) for key, value in row.items()})
+        return counts
+
+    async def prediction_totals(self) -> dict:
+        """Число выданных, невыданных и ещё не проверенных прогнозов (охват и ожидание)."""
+        row = await self._db.fetchone(
+            "SELECT COUNT(*) AS total, COALESCE(SUM(is_issued), 0) AS issued, "
+            "COALESCE(SUM(CASE WHEN is_issued = 1 AND evaluated_at IS NULL "
+            "THEN 1 ELSE 0 END), 0) AS pending FROM predictions"
+        )
+        if row is None:
+            return {"total": 0, "issued": 0, "pending": 0}
+        return {
+            "total": int(row["total"]),
+            "issued": int(row["issued"]),
+            "pending": int(row["pending"]),
+        }
+
+    async def evaluated_since(self, since: datetime) -> list[dict]:
+        """Проверенные выданные прогнозы, проверка которых завершена не раньше since."""
+        return await self._db.fetchall(
+            "SELECT id, model, ticker, is_successful, target_hit, evaluated_at, created_at "
+            "FROM predictions WHERE is_issued = 1 AND evaluated_at IS NOT NULL "
+            "AND evaluated_at >= ? ORDER BY evaluated_at, id",
+            (to_iso(since),),
+        )
+

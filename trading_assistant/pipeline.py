@@ -29,6 +29,7 @@ from .news.clustering import find_cluster
 from .news.fulltext import RobotsCache, get_fulltext
 from .news.prefilter import normalize_title, passes_prefilter
 from .news.sources import RawItem, fetch_feed, parse_feed
+from .reports.reports import PROPOSALS_KEY, ReportService
 from .repository import Repository
 from .stats import Stats
 
@@ -41,6 +42,14 @@ PROJECT_STATE_KEY = "project_state"
 PROJECT_STATE_PAIR_TEST = "pair_test"
 PROJECT_STATE_CANDIDATES_TEST = "candidates_test"
 CONSENSUS_MODEL = "consensus"
+# Виды событийных писем для предложений сервиса (STEP 4D).
+PROJECT_RESULT_KIND = "project_result"
+PROPOSAL_EVENT_KINDS = {
+    "replace_model": "replace_proposal",
+    "best_pair": "best_pair_proposal",
+}
+PROJECT_SUITABLE_KIND = "project_suitable"
+PROJECT_UNSUITABLE_KIND = "project_unsuitable"
 
 
 @dataclass
@@ -147,6 +156,7 @@ class AnalyzeDeps:
     registry: InstrumentRegistry
     prompt_template: str
     tz: ZoneInfo
+    reports: ReportService | None = None
 
 
 @dataclass
@@ -322,6 +332,7 @@ async def analyze_stage(deps: AnalyzeDeps, now: datetime) -> AnalyzeStats:
                 "суточный бюджет исчерпан: анализ остановлен, кластеров отложено %d",
                 stats.skipped_budget,
             )
+            await _budget_event(deps, budget, now)
             break
 
         cluster_id = int(cluster["id"])
@@ -348,6 +359,7 @@ async def analyze_stage(deps: AnalyzeDeps, now: datetime) -> AnalyzeStats:
                 "фатальная ошибка модели: анализ прерван, кластер %s остаётся pending",
                 cluster_id,
             )
+            await _fatal_event(deps, cluster_id, pair_results)
             return stats
 
         if candidates and await budget.allowed(
@@ -405,6 +417,44 @@ async def analyze_stage(deps: AnalyzeDeps, now: datetime) -> AnalyzeStats:
 
 
 BASE_PRICE_WINDOW_HOURS = 24
+
+
+async def _budget_event(deps: AnalyzeDeps, budget: Budget, now: datetime) -> None:
+    """Событийное письмо об исчерпании суточного бюджета (один раз за сутки МСК)."""
+    if deps.reports is None:
+        return
+    day = now.astimezone(deps.tz).date().isoformat()
+    spent = await budget.spent_today(now)
+    await deps.reports.event(
+        "budget_exhausted",
+        day,
+        {
+            "text": "Анализ новостей остановлен до следующих суток: кластеры остаются в очереди.",
+            "date": day,
+            "spent_usd": f"{spent:.4f}",
+            "limit_usd": f"{deps.settings.llm.daily_budget_usd:.4f}",
+        },
+    )
+
+
+async def _fatal_event(
+    deps: AnalyzeDeps, cluster_id: int, results: list[tuple[ModelOutcome, list[RunRecord]]]
+) -> None:
+    """Событийные письма о фатальном сбое LLM (401/402/403), по одному на модель и кластер."""
+    if deps.reports is None:
+        return
+    for outcome, _ in results:
+        if outcome.status != "fatal":
+            continue
+        await deps.reports.event(
+            "llm_fatal",
+            f"{outcome.model}:{cluster_id}",
+            {
+                "text": "Анализ прерван: проверьте ключ и баланс провайдера LLM.",
+                "model": outcome.model,
+                "cluster_id": cluster_id,
+            },
+        )
 CANDLES_LOOKBACK_DAYS = 7
 LAST_BACKTEST_KEY = "last_backtest"
 
@@ -417,6 +467,7 @@ class PriceDeps:
     settings: AppSettings
     registry: InstrumentRegistry
     tz: ZoneInfo
+    reports: ReportService | None = None
 
 
 @dataclass
@@ -523,10 +574,70 @@ async def backtest_stage(deps: PriceDeps, now: datetime) -> BacktestStats:
 
 
 async def _evaluation_update(deps: PriceDeps, now: datetime) -> list[Proposal]:
-    """Обновить тесты пары, моделей и кандидатов после проверки прогнозов (STEP 4C)."""
+    """Обновить тесты пары, моделей и кандидатов после проверки прогнозов (STEP 4C, 4D)."""
     stats = Stats(deps.repository, deps.settings.signal, deps.settings.evaluation, lambda: now)
     evaluator = Evaluator(deps.repository, stats, deps.settings, lambda: now)
+    done_before = {int(test["id"]) for test in await deps.repository.done_tests()}
     proposals = await evaluator.update(now)
     for proposal in proposals:
         logger.info("предложение (%s): %s", proposal.kind, proposal.text)
+    if proposals:
+        await deps.repository.kv_set(
+            PROPOSALS_KEY, "\n".join(f"{p.kind}: {p.text}" for p in proposals)
+        )
+    await _report_events(deps.repository, deps.reports, done_before, proposals)
     return proposals
+
+
+@dataclass
+class ReportsDeps:
+    """Зависимости этапа отчётов: сервис ежедневного, еженедельного и событийных писем."""
+
+    service: ReportService
+
+
+async def reports_stage(deps: ReportsDeps, now: datetime) -> list[str]:
+    """Отправить отчёты, время которых наступило; вернуть виды отправленных отчётов."""
+    return await deps.service.run(now)
+
+
+async def _report_events(
+    repo: Repository,
+    reports: ReportService | None,
+    done_before: set[int],
+    proposals: list[Proposal],
+) -> None:
+    """Событийные письма о закрытых тестах и предложениях сервиса (по одному на событие)."""
+    if reports is None:
+        return
+    for test in await repo.done_tests():
+        if int(test["id"]) in done_before:
+            continue
+        await reports.event("test_done", str(test["id"]), _test_payload(test))
+    for proposal in proposals:
+        kind = PROPOSAL_EVENT_KINDS.get(proposal.kind)
+        if proposal.kind == PROJECT_RESULT_KIND:
+            kind = await _project_result_kind(repo)
+        if kind is None:
+            continue
+        await reports.event(kind, proposal.text, {"text": proposal.text})
+
+
+async def _project_result_kind(repo: Repository) -> str:
+    """Вид события по состоянию проекта после закрытия теста пары: пригоден / не пригоден."""
+    state = await repo.kv_get(PROJECT_STATE_KEY)
+    if state == PROJECT_STATE_CANDIDATES_TEST:
+        return PROJECT_SUITABLE_KIND
+    return PROJECT_UNSUITABLE_KIND
+
+
+def _test_payload(test: dict) -> dict:
+    """Данные события о завершённом тесте: вердикт, выборка, точность, стоимость."""
+    return {
+        "text": (
+            f"{test['subject']} ({test['role']}): вердикт {test['verdict']}, "
+            f"сбылось {float(test['success_pct'] or 0.0):.1f}% (n={test['n']}), "
+            f"стоимость выданных ${float(test['cost_issued_usd'] or 0.0):.4f}, "
+            f"эффективность {test['efficiency']}"
+        ),
+    }

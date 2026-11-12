@@ -151,12 +151,24 @@ async def _cluster_status(db: Database, cluster_id: int) -> str:
     return row["status"] if row else ""
 
 
+class _Reports:
+    """Поддельный сервис отчётов: запоминает событийные письма."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, dict]] = []
+
+    async def event(self, kind: str, key: str, payload: dict) -> bool:
+        self.events.append((kind, key, payload))
+        return True
+
+
 async def _run(
     db: Database,
     api: _Api,
     registry: InstrumentRegistry,
     now: datetime = NOW,
     settings: AppSettings | None = None,
+    reports: _Reports | None = None,
 ) -> AnalyzeStats:
     """Выполнить analyze_stage против поддельного HTTP-транспорта."""
     cfg = settings or _settings()
@@ -170,6 +182,7 @@ async def _run(
             registry=registry,
             prompt_template=TEMPLATE,
             tz=MSK,
+            reports=reports,
         )
         return await analyze_stage(deps, now)
     finally:
@@ -254,6 +267,36 @@ async def test_budget_exhausted_calls_nothing(db, registry) -> None:
     assert stats.skipped_budget == 2
     statuses = await db.fetchall("SELECT status FROM clusters WHERE status = 'pending'")
     assert len(statuses) == 2
+
+
+async def test_fatal_error_sends_event(db, registry) -> None:
+    """Фатальный сбой LLM (401) — одно событийное письмо на модель и кластер (4D)."""
+    await _add_cluster(db)
+    api = _Api({PAIR_A: [_error(401)], PAIR_B: [_ok(_content())]})
+    reports = _Reports()
+
+    await _run(db, api, registry, reports=reports)
+
+    assert [event[0] for event in reports.events] == ["llm_fatal"]
+    _, key, payload = reports.events[0]
+    assert key == f"{PAIR_A}:1"
+    assert payload["model"] == PAIR_A
+
+
+async def test_budget_exhausted_sends_event(db, registry) -> None:
+    """Исчерпан суточный бюджет — событийное письмо с датой суток МСК (4D)."""
+    await _add_cluster(db, title="Первая новость")
+    await _add_spent(db, 0.5)
+    api = _Api({})
+    reports = _Reports()
+
+    await _run(db, api, registry, reports=reports)
+
+    assert [event[0] for event in reports.events] == ["budget_exhausted"]
+    _, key, payload = reports.events[0]
+    assert key == "2026-11-06"  # сутки МСК от NOW (15:00 МСК)
+    assert payload["spent_usd"] == "0.5000"
+    assert payload["limit_usd"] == "0.5000"
 
 
 async def test_candidate_failure_keeps_cluster_analyzed(db, registry) -> None:

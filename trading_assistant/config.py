@@ -168,11 +168,11 @@ class EnvSettings(BaseSettings):
     OPENROUTER_API_KEY: str = ""
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_IDS: str = ""
-    SMTP_HOST: str = ""
+    SMTP_HOST: str | None = None
     SMTP_PORT: int = 465
-    SMTP_USER: str = ""
-    SMTP_PASSWORD: str = ""
-    REPORT_EMAIL_TO: str = ""
+    SMTP_USER: str | None = None
+    SMTP_PASSWORD: str | None = None
+    REPORT_EMAIL_TO: str | None = None
 
 
 def load_settings(path: Path = Path("config/settings.yaml")) -> AppSettings:
@@ -212,7 +212,7 @@ def env_checklist(env: EnvSettings) -> tuple[list[str], bool]:
     lines: list[str] = []
     ok = True
 
-    def line(name: str, required: bool, value: str) -> None:
+    def line(name: str, required: bool, value: str | None) -> None:
         nonlocal ok
         if value:
             lines.append(f"[OK] {name}")

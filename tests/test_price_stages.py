@@ -10,12 +10,14 @@ import httpx
 from trading_assistant.clock import FakeClock, to_iso
 from trading_assistant.config import AppSettings, load_settings
 from trading_assistant.db import Database
+from trading_assistant.evaluation import Proposal
 from trading_assistant.instruments import InstrumentRegistry
 from trading_assistant.market.moex import MoexClient
 from trading_assistant.pipeline import (
     BacktestStats,
     BasePriceStats,
     PriceDeps,
+    _report_events,
     backtest_stage,
     base_price_stage,
 )
@@ -27,6 +29,9 @@ CREATED = datetime(2026, 3, 2, 7, 0, tzinfo=UTC)  # 10:00 МСК, день со�
 RECENT = datetime(2026, 3, 10, 8, 0, tzinfo=UTC)  # за час до NOW — внутри окна 24 ч
 LATER = datetime(2026, 4, 5, 9, 0, tzinfo=UTC)  # срок прогноза (30 дн.) истёк
 BASE_URL = "https://iss.example.invalid"
+PAIR_A = "anthropic/claude-sonnet-5.5"
+PAIR_B = "x-ai/grok-4.7"
+PAIR_KEY = f"{PAIR_A}+{PAIR_B}"
 CandleRow = tuple[date, float, float, float]
 
 
@@ -324,3 +329,52 @@ async def test_backtest_creates_pair_and_pair_model_tests(db, registry) -> None:
     assert len(rows) == 3
     assert {row["role"] for row in rows} == {"pair", "pair_model"}
     assert {row["status"] for row in rows} == {"running"}
+
+
+class _Reports:
+    """Поддельный сервис отчётов: запоминает событийные письма."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, dict]] = []
+
+    async def event(self, kind: str, key: str, payload: dict) -> bool:
+        self.events.append((kind, key, payload))
+        return True
+
+
+async def test_closed_test_and_proposal_are_reported(db) -> None:
+    """Закрытый тест и предложение сервиса дают событийные письма (4D)."""
+    repo = Repository(db)
+    test = await repo.get_or_create_test(f"pair:{PAIR_KEY}", "pair", "v2", NOW)
+    await repo.close_test(test["id"], 100, 80.0, 0.5, 1.0, 0.00625, "suitable", NOW)
+    reports = _Reports()
+
+    await _report_events(repo, reports, set(), [Proposal("replace_model", "замените модель")])
+
+    assert [event[0] for event in reports.events] == ["test_done", "replace_proposal"]
+    assert reports.events[0][1] == str(test["id"])
+    assert "suitable" in reports.events[0][2]["text"]
+    assert reports.events[1][2]["text"] == "замените модель"
+
+
+async def test_report_events_skip_known_tests(db) -> None:
+    """Уже закоммиченный (известный) тест повторно письмом не сообщается."""
+    repo = Repository(db)
+    test = await repo.get_or_create_test(f"pair:{PAIR_KEY}", "pair", "v2", NOW)
+    await repo.close_test(test["id"], 100, 80.0, 0.5, 1.0, 0.00625, "suitable", NOW)
+    reports = _Reports()
+
+    await _report_events(repo, reports, {int(test["id"])}, [])
+
+    assert reports.events == []
+
+
+async def test_project_result_event_follows_state(db) -> None:
+    """Итог проекта превращается в письмо «пригоден»/«не пригоден» по состоянию в kv."""
+    repo = Repository(db)
+    await repo.kv_set("project_state", "candidates_test")
+    reports = _Reports()
+
+    await _report_events(repo, reports, set(), [Proposal("project_result", "ПРОЕКТ ПРИГОДЕН")])
+
+    assert [event[0] for event in reports.events] == ["project_suitable"]
