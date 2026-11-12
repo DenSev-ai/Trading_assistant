@@ -310,3 +310,17 @@ async def test_last_backtest_time_is_stored(db, registry) -> None:
     await _run_backtest(db, api, registry)
 
     assert await Repository(db).kv_get("last_backtest") == to_iso(NOW)
+
+
+async def test_backtest_creates_pair_and_pair_model_tests(db, registry) -> None:
+    """После проверки прогнозов backtest_stage создаёт записи тестов пары и её моделей (4C)."""
+    await _add_prediction(db, base_price=100.0)
+    api = _Moex(candles=[(date(2026, 3, 5), 116.0, 99.0, 101.0)])
+
+    stats = await _run_backtest(db, api, registry)
+
+    assert stats.proposals == []
+    rows = await db.fetchall("SELECT subject, role, status FROM model_tests ORDER BY id")
+    assert len(rows) == 3
+    assert {row["role"] for row in rows} == {"pair", "pair_model"}
+    assert {row["status"] for row in rows} == {"running"}

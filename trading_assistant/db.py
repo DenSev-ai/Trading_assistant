@@ -76,14 +76,21 @@ CREATE TABLE IF NOT EXISTS predictions (
 CREATE TABLE IF NOT EXISTS model_tests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   subject TEXT NOT NULL,
+  role TEXT NOT NULL,
   prompt_version TEXT NOT NULL,
-  n INTEGER NOT NULL DEFAULT 0,
-  success_pct REAL NOT NULL DEFAULT 0,
-  cost_issued_usd REAL NOT NULL DEFAULT 0,
-  verdict TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'running',
-  updated_at TEXT NOT NULL
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  n INTEGER,
+  success_pct REAL,
+  cost_issued_usd REAL,
+  cost_total_usd REAL,
+  efficiency REAL,
+  verdict TEXT,
+  UNIQUE(subject, role, prompt_version)
 );
+CREATE INDEX IF NOT EXISTS ix_tests_subject ON model_tests(subject, status);
+CREATE INDEX IF NOT EXISTS ix_pred_ticker ON predictions(ticker, created_at);
 CREATE TABLE IF NOT EXISTS deliveries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   prediction_id INTEGER REFERENCES predictions(id),

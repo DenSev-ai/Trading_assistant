@@ -332,9 +332,10 @@ async def test_candidates_limited_by_parallel(db, registry) -> None:
 async def test_candidate_with_done_test_skipped(db, registry) -> None:
     await Repository(db).kv_set("project_state", "candidates_test")
     await db.execute(
-        "INSERT INTO model_tests (subject, prompt_version, n, success_pct, cost_issued_usd, "
-        "verdict, status, updated_at) VALUES (?, 'v2', 100, 80.0, 0.0, 'suitable', 'done', ?)",
-        (CANDIDATES[0], to_iso(NOW)),
+        "INSERT INTO model_tests (subject, role, prompt_version, status, started_at, finished_at, "
+        "n, success_pct, cost_issued_usd, cost_total_usd, efficiency, verdict) "
+        "VALUES (?, 'candidate', 'v2', 'done', ?, ?, 100, 80.0, 0.0, 0.0, 0.0, 'suitable')",
+        (CANDIDATES[0], to_iso(NOW), to_iso(NOW)),
     )
     await _add_cluster(db)
     api = _Api(

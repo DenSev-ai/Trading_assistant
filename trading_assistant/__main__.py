@@ -25,6 +25,7 @@ from .pipeline import (
     collect_stage,
 )
 from .repository import Repository
+from .stats import Stats
 
 PROMPT_PATH = Path("prompts/analyze_news.txt")
 
@@ -49,6 +50,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="не отправлять сообщения в Telegram (на этом шаге отправки нет)",
     )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="напечатать статистику проекта и моделей (состояние, таблица тестов, вердикт)",
+    )
     args = parser.parse_args(argv)
 
     if args.check_config:
@@ -58,11 +64,34 @@ def main(argv: list[str] | None = None) -> int:
             print(line)
         return 0 if ok else 1
 
+    if args.report:
+        return _print_report()
+
     if args.once:
         return _run_once(dry_run=args.dry_run)
 
     parser.print_help()
     return 0
+
+
+def _print_report() -> int:
+    """Напечатать статистику проекта и моделей (--report); пустая БД не ошибка."""
+    settings = load_settings()
+    data_dir = Path(settings.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db = Database(str(data_dir / "trading.db"))
+    clock = SystemClock()
+
+    async def run() -> int:
+        await db.init()
+        try:
+            stats = Stats(Repository(db), settings.signal, settings.evaluation, clock.now)
+            print(await stats.report(clock.now()))
+        finally:
+            await db.close()
+        return 0
+
+    return asyncio.run(run())
 
 
 def _run_once(dry_run: bool) -> int:

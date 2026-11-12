@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -12,6 +12,7 @@ import httpx
 from .backtest import evaluate
 from .clock import msk_date, to_iso
 from .config import AppSettings, Keywords, ModelSpec, NewsSource, SignalSettings
+from .evaluation import Evaluator, Proposal
 from .instruments import InstrumentRegistry
 from .llm.analyzer import (
     ModelOutcome,
@@ -29,6 +30,7 @@ from .news.fulltext import RobotsCache, get_fulltext
 from .news.prefilter import normalize_title, passes_prefilter
 from .news.sources import RawItem, fetch_feed, parse_feed
 from .repository import Repository
+from .stats import Stats
 
 logger = logging.getLogger(__name__)
 
@@ -434,6 +436,7 @@ class BacktestStats:
     waiting: int = 0
     unknown: int = 0
     skipped: bool = False
+    proposals: list[Proposal] = field(default_factory=list)
 
 
 async def base_price_stage(deps: PriceDeps, now: datetime) -> BasePriceStats:
@@ -515,4 +518,15 @@ async def backtest_stage(deps: PriceDeps, now: datetime) -> BacktestStats:
             stats.evaluated += 1
 
     await deps.repository.kv_set(LAST_BACKTEST_KEY, to_iso(now))
+    stats.proposals = await _evaluation_update(deps, now)
     return stats
+
+
+async def _evaluation_update(deps: PriceDeps, now: datetime) -> list[Proposal]:
+    """Обновить тесты пары, моделей и кандидатов после проверки прогнозов (STEP 4C)."""
+    stats = Stats(deps.repository, deps.settings.signal, deps.settings.evaluation, lambda: now)
+    evaluator = Evaluator(deps.repository, stats, deps.settings, lambda: now)
+    proposals = await evaluator.update(now)
+    for proposal in proposals:
+        logger.info("предложение (%s): %s", proposal.kind, proposal.text)
+    return proposals

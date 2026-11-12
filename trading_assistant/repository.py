@@ -256,6 +256,144 @@ class Repository:
         )
         return {row["subject"] for row in rows}
 
+    async def get_or_create_test(
+        self, subject: str, role: str, prompt_version: str, now: datetime
+    ) -> dict:
+        """Запись model_tests по (subject, role, prompt_version); если её нет — создать running."""
+        await self._db.execute(
+            "INSERT OR IGNORE INTO model_tests (subject, role, prompt_version, status, started_at) "
+            "VALUES (?, ?, ?, 'running', ?)",
+            (subject, role, prompt_version, to_iso(now)),
+        )
+        row = await self._db.fetchone(
+            "SELECT * FROM model_tests WHERE subject = ? AND role = ? AND prompt_version = ?",
+            (subject, role, prompt_version),
+        )
+        if row is None:
+            raise RuntimeError(f"не создать запись model_tests для {subject}/{role}")
+        return row
+
+    async def running_tests(self) -> list[dict]:
+        """Незавершённые тесты (status='running') в порядке старта."""
+        return await self._db.fetchall(
+            "SELECT * FROM model_tests WHERE status = 'running' ORDER BY started_at, id"
+        )
+
+    async def done_tests(self) -> list[dict]:
+        """Завершённые тесты (status='done') в порядке старта."""
+        return await self._db.fetchall(
+            "SELECT * FROM model_tests WHERE status = 'done' ORDER BY started_at, id"
+        )
+
+    async def close_test(
+        self,
+        test_id: int,
+        n: int,
+        success_pct: float,
+        cost_issued: float,
+        cost_total: float,
+        efficiency: float | None,
+        verdict: str,
+        now: datetime,
+    ) -> None:
+        """Закрыть тест один раз: вердикт и цифры больше не меняются."""
+        await self._db.execute(
+            "UPDATE model_tests SET status = 'done', finished_at = ?, n = ?, success_pct = ?, "
+            "cost_issued_usd = ?, cost_total_usd = ?, efficiency = ?, verdict = ? "
+            "WHERE id = ? AND status = 'running'",
+            (
+                to_iso(now),
+                n,
+                success_pct,
+                cost_issued,
+                cost_total,
+                efficiency,
+                verdict,
+                test_id,
+            ),
+        )
+
+    async def issued_predictions(
+        self,
+        model: str,
+        pair_key: str | None = None,
+        prompt_version: str | None = None,
+    ) -> list[dict]:
+        """Выданные прогнозы модели (для 'consensus' — с pair_key) в порядке создания."""
+        sql = (
+            "SELECT id, created_at, evaluated_at, is_successful, cluster_id, run_id, ticker, "
+            "pair_key FROM predictions WHERE model = ? AND is_issued = 1"
+        )
+        params: list[object] = [model]
+        if pair_key is not None:
+            sql += " AND pair_key = ?"
+            params.append(pair_key)
+        if prompt_version is not None:
+            sql += " AND prompt_version = ?"
+            params.append(prompt_version)
+        sql += " ORDER BY created_at, id"
+        return await self._db.fetchall(sql, tuple(params))
+
+    async def runs_cost(
+        self,
+        model: str,
+        cluster_ids: list[int] | None = None,
+        only_ok: bool = False,
+    ) -> float:
+        """Стоимость запросов модели: всех или по указанным кластерам, при only_ok — успешных."""
+        if cluster_ids is not None and not cluster_ids:
+            return 0.0
+        sql = "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM model_runs WHERE model = ?"
+        params: list[object] = [model]
+        if cluster_ids is not None:
+            placeholders = ", ".join("?" for _ in cluster_ids)
+            sql += f" AND cluster_id IN ({placeholders})"
+            params.extend(cluster_ids)
+        if only_ok:
+            sql += " AND status = 'ok'"
+        row = await self._db.fetchone(sql, tuple(params))
+        return float(row["total"]) if row is not None else 0.0
+
+    async def distinct_run_cost(self, run_ids: list[int]) -> float:
+        """Суммарная стоимость указанных запросов (каждый запрос считается один раз)."""
+        if not run_ids:
+            return 0.0
+        placeholders = ", ".join("?" for _ in run_ids)
+        row = await self._db.fetchone(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM model_runs "
+            f"WHERE id IN ({placeholders})",
+            tuple(run_ids),
+        )
+        return float(row["total"]) if row is not None else 0.0
+
+    async def success_counts(
+        self,
+        model: str,
+        ticker: str | None = None,
+        pair_key: str | None = None,
+        prompt_version: str | None = None,
+    ) -> tuple[int, int]:
+        """Сколько проверенных выданных прогнозов модели и сколько из них сбылось."""
+        sql = (
+            "SELECT COUNT(*) AS n, COALESCE(SUM(is_successful), 0) AS ok FROM predictions "
+            "WHERE model = ? AND is_issued = 1 AND evaluated_at IS NOT NULL "
+            "AND is_successful IS NOT NULL"
+        )
+        params: list[object] = [model]
+        if ticker is not None:
+            sql += " AND ticker = ?"
+            params.append(ticker)
+        if pair_key is not None:
+            sql += " AND pair_key = ?"
+            params.append(pair_key)
+        if prompt_version is not None:
+            sql += " AND prompt_version = ?"
+            params.append(prompt_version)
+        row = await self._db.fetchone(sql, tuple(params))
+        if row is None:
+            return 0, 0
+        return int(row["ok"]), int(row["n"])
+
     async def kv_get(self, key: str) -> str | None:
         """Значение ключа из kv или None, если ключа нет."""
         row = await self._db.fetchone("SELECT value FROM kv WHERE key = ?", (key,))
