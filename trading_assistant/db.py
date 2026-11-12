@@ -93,9 +93,10 @@ CREATE INDEX IF NOT EXISTS ix_tests_subject ON model_tests(subject, status);
 CREATE INDEX IF NOT EXISTS ix_pred_ticker ON predictions(ticker, created_at);
 CREATE TABLE IF NOT EXISTS deliveries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  prediction_id INTEGER REFERENCES predictions(id),
-  chat_id TEXT NOT NULL,
-  status TEXT NOT NULL,
+  prediction_id INTEGER NOT NULL REFERENCES predictions(id),
+  ticker TEXT NOT NULL,
+  kind TEXT NOT NULL,                        -- alert|digest|suppressed
+  chat_id TEXT,
   sent_at TEXT NOT NULL,
   error TEXT
 );
@@ -106,6 +107,12 @@ CREATE TABLE IF NOT EXISTS kv (
 """
 
 TABLES = ("clusters", "articles", "model_runs", "predictions", "model_tests", "deliveries", "kv")
+
+# Колонки, появившиеся в deliveries на шаге 5: старые базы доводятся мягкой миграцией.
+DELIVERY_EXTRA_COLUMNS = {
+    "kind": "TEXT NOT NULL DEFAULT ''",
+    "ticker": "TEXT NOT NULL DEFAULT ''",
+}
 
 
 class Database:
@@ -118,6 +125,29 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(DDL)
+        await self._conn.commit()
+        await self._migrate_deliveries()
+
+    async def _migrate_deliveries(self) -> None:
+        """Довести таблицу deliveries до схемы CONTRACTS §1 (колонки kind, ticker и индекс)."""
+        assert self._conn is not None, "Database.init() не вызван"
+        cur = await self._conn.execute("PRAGMA table_info(deliveries)")
+        columns = {row[1] for row in await cur.fetchall()}
+        for name, ddl in DELIVERY_EXTRA_COLUMNS.items():
+            if name in columns:
+                continue
+            await self._conn.execute(f"ALTER TABLE deliveries ADD COLUMN {name} {ddl}")
+            if name == "kind" and "status" in columns:
+                # Старые записи хранили вид доставки в колонке status.
+                await self._conn.execute("UPDATE deliveries SET kind = status WHERE kind = ''")
+            if name == "ticker":
+                await self._conn.execute(
+                    "UPDATE deliveries SET ticker = COALESCE((SELECT p.ticker FROM predictions p "
+                    "WHERE p.id = deliveries.prediction_id), '') WHERE ticker = ''"
+                )
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_deliv_ticker ON deliveries(ticker, sent_at)"
+        )
         await self._conn.commit()
 
     async def execute(self, sql: str, params: tuple = ()) -> int:

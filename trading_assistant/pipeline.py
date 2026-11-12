@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from .backtest import evaluate
-from .clock import msk_date, to_iso
+from .clock import get_phase, msk_date, to_iso
 from .config import AppSettings, Keywords, ModelSpec, NewsSource, SignalSettings
 from .evaluation import Evaluator, Proposal
 from .instruments import InstrumentRegistry
@@ -32,6 +32,8 @@ from .news.sources import RawItem, fetch_feed, parse_feed
 from .reports.reports import PROPOSALS_KEY, ReportService
 from .repository import Repository
 from .stats import Stats
+from .telegram.dispatcher import Dispatcher, DispatchStats
+from .telegram.health import COLLECT_OK_KEY, SOURCES_DOWN_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +145,13 @@ async def collect_stage(deps: CollectDeps, now: datetime) -> CollectStats:
             else:
                 await deps.repository.attach_to_cluster(article_id, cluster_id, src.name, now)
             stats.clustered += 1
+
+    # Здоровье сервиса: был ли в этом цикле хоть один рабочий источник (HealthMonitor).
+    if source_items:
+        await deps.repository.kv_set(COLLECT_OK_KEY, to_iso(now))
+        await deps.repository.kv_delete(SOURCES_DOWN_KEY)
+    else:
+        await deps.repository.kv_set(SOURCES_DOWN_KEY, to_iso(now))
 
     return stats
 
@@ -641,3 +650,19 @@ def _test_payload(test: dict) -> dict:
             f"эффективность {test['efficiency']}"
         ),
     }
+
+
+@dataclass
+class DispatchDeps:
+    """Зависимости этапа доставки: диспетчер Telegram, настройки и пояс."""
+
+    dispatcher: Dispatcher
+    settings: AppSettings
+    tz: ZoneInfo
+
+
+async def dispatch_stage(deps: DispatchDeps, now: datetime) -> DispatchStats:
+    """Отправить сигналы и утренний дайджест по фазе расписания (шестой этап цикла)."""
+    phase = get_phase(now, deps.settings.schedule, deps.tz)
+    return await deps.dispatcher.dispatch(phase, now)
+

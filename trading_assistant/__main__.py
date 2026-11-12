@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 from collections.abc import Callable
 from datetime import datetime
@@ -17,22 +18,27 @@ from .db import Database
 from .evaluation import Evaluator
 from .instruments import InstrumentRegistry
 from .llm.client import OpenRouterClient
+from .llm.consensus import make_pair_key
+from .logging_setup import setup_logging
 from .market.moex import MoexClient
 from .pipeline import (
     AnalyzeDeps,
     CollectDeps,
+    DispatchDeps,
     PriceDeps,
     ReportsDeps,
     analyze_stage,
     backtest_stage,
     base_price_stage,
     collect_stage,
+    dispatch_stage,
     reports_stage,
 )
 from .reports.mailer import file_mailer, make_mailer, reports_dir
 from .reports.reports import DAILY, WEEKLY, ReportService
 from .repository import Repository
 from .stats import Stats
+from .telegram.dispatcher import BotNotifier, Dispatcher, LogNotifier, Notifier
 
 PROMPT_PATH = Path("prompts/analyze_news.txt")
 
@@ -55,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="не отправлять сообщения в Telegram (на этом шаге отправки нет)",
+        help="не отправлять в Telegram: сообщения пишутся в лог, deliveries не ведутся",
     )
     parser.add_argument(
         "--report",
@@ -109,6 +115,33 @@ def _print_report() -> int:
     return asyncio.run(run())
 
 
+def _chat_ids(raw: str) -> list[int]:
+    """Список chat_id из TELEGRAM_CHAT_IDS (через запятую); мусор пропускается с пометкой."""
+    ids: list[int] = []
+    for part in raw.split(","):
+        piece = part.strip()
+        if not piece:
+            continue
+        try:
+            ids.append(int(piece))
+        except ValueError:
+            print(f"[!] TELEGRAM_CHAT_IDS: значение «{piece}» пропущено (нужен chat_id)")
+    return ids
+
+
+def _notifier(env: EnvSettings, chat_ids: list[int], dry_run: bool) -> Notifier:
+    """BotNotifier при настроенном Telegram; без токена, chat_id или в --dry-run — лог."""
+    if dry_run or not env.TELEGRAM_BOT_TOKEN or not chat_ids:
+        return LogNotifier()
+    from aiogram import Bot  # локально: aiogram нужен только в режиме бота
+
+    try:
+        return BotNotifier(Bot(token=env.TELEGRAM_BOT_TOKEN))
+    except Exception as exc:  # некорректный токен не должен останавливать сервис
+        print(f"[!] Telegram-бот не создан ({type(exc).__name__}); сообщения идут в лог")
+        return LogNotifier()
+
+
 def _report_service(
     settings: AppSettings,
     env: EnvSettings,
@@ -158,8 +191,13 @@ def _send_report(kind: str) -> int:
     return asyncio.run(run())
 
 
+def _log_level(name: str) -> int:
+    """Уровень логирования по имени из конфига; незнакомое имя — INFO."""
+    return getattr(logging, name.upper(), logging.INFO)
+
+
 def _run_once(dry_run: bool) -> int:
-    """Один цикл сбора новостей и анализа кластеров с печатью счётчиков."""
+    """Один цикл сбора, анализа, проверки и доставки с печатью счётчиков."""
     settings = load_settings()
     keywords = load_keywords(Path("config/keywords.yaml"))
     registry = InstrumentRegistry.load(Path("config/instruments.json"))
@@ -167,8 +205,11 @@ def _run_once(dry_run: bool) -> int:
     template = PROMPT_PATH.read_text(encoding="utf-8")
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
+    setup_logging(data_dir, _log_level(settings.log_level))
     tz = ZoneInfo(settings.timezone)
     db = Database(str(data_dir / "trading.db"))
+    chat_ids = _chat_ids(env.TELEGRAM_CHAT_IDS)
+    notifier = _notifier(env, chat_ids, dry_run)
 
     async def run() -> int:
         await db.init()
@@ -209,7 +250,23 @@ def _run_once(dry_run: bool) -> int:
             )
             priced = await base_price_stage(price_deps, now)
             checked = await backtest_stage(price_deps, now)
+            dispatcher = Dispatcher(
+                repo,
+                stats,
+                notifier,
+                chat_ids,
+                settings.telegram,
+                registry,
+                tz=tz,
+                signal=settings.signal,
+                pair_key=make_pair_key([model.id for model in settings.llm.pair]),
+                prompt_version=settings.llm.prompt_version,
+                record_deliveries=not dry_run,
+            )
+            dispatched = await dispatch_stage(DispatchDeps(dispatcher, settings, tz), now)
             sent = await reports_stage(ReportsDeps(service=service), now)
+        if isinstance(notifier, BotNotifier):
+            await notifier.close()
         await db.close()
         print(
             f"собрано={collected.fetched}, дубли={collected.duplicates}, "
@@ -227,9 +284,15 @@ def _run_once(dry_run: bool) -> int:
             f"проверено прогнозов={checked.evaluated} из {checked.checked}, "
             f"ждут срока={checked.waiting}, пропуск по интервалу={checked.skipped}"
         )
+        print(
+            f"доставка: алертов={dispatched.alerts}, "
+            f"подавлено анти-спамом={dispatched.suppressed}, "
+            f"в дайджест={dispatched.queued}, сообщений дайджеста={dispatched.digest_messages}, "
+            f"ошибок доставки={dispatched.errors}"
+        )
         print(f"отчёты: {', '.join(sent) if sent else 'нет'}")
         if dry_run:
-            print("режим --dry-run: отправка сообщений отключена")
+            print("режим --dry-run: сообщения в лог, deliveries не пишутся")
         return 0
 
     return asyncio.run(run())

@@ -394,6 +394,99 @@ class Repository:
             return 0, 0
         return int(row["ok"]), int(row["n"])
 
+    async def undelivered_signals(
+        self, pair_key: str, prompt_version: str, since: datetime | None = None
+    ) -> list[dict]:
+        """Сигналы consensus текущей пары без записи в deliveries, в порядке создания."""
+        sql = (
+            "SELECT p.id, p.ticker, p.direction, p.confidence, p.horizon_days, "
+            "p.expected_change_pct, p.reason, p.severity, p.created_at, "
+            "c.sources_count AS sources_count, a.url AS url, a.title AS title "
+            "FROM predictions p JOIN clusters c ON c.id = p.cluster_id "
+            "LEFT JOIN articles a ON a.id = c.main_article_id "
+            "WHERE p.model = 'consensus' AND p.is_issued = 1 AND p.pair_key = ? "
+            "AND p.prompt_version = ? AND NOT EXISTS "
+            "(SELECT 1 FROM deliveries d WHERE d.prediction_id = p.id)"
+        )
+        params: list[object] = [pair_key, prompt_version]
+        if since is not None:
+            sql += " AND p.created_at >= ?"
+            params.append(to_iso(since))
+        sql += " ORDER BY p.created_at, p.id"
+        return await self._db.fetchall(sql, tuple(params))
+
+    async def last_delivery_at(self, ticker: str, kinds: tuple[str, ...]) -> str | None:
+        """Время последней доставки по тикеру среди указанных видов (None — не было)."""
+        if not kinds:
+            return None
+        placeholders = ", ".join("?" for _ in kinds)
+        row = await self._db.fetchone(
+            "SELECT MAX(sent_at) AS last FROM deliveries "
+            f"WHERE ticker = ? AND kind IN ({placeholders})",
+            (ticker, *kinds),
+        )
+        return row["last"] if row is not None and row["last"] is not None else None
+
+    async def add_delivery(
+        self,
+        prediction_id: int,
+        ticker: str,
+        kind: str,
+        now: datetime,
+        chat_id: str | None = None,
+        error: str | None = None,
+    ) -> int:
+        """Записать доставку сигнала: вид alert|digest|suppressed, время и подробности."""
+        return await self._db.execute(
+            "INSERT INTO deliveries (prediction_id, ticker, kind, chat_id, sent_at, error) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (prediction_id, ticker, kind, chat_id, to_iso(now), error),
+        )
+
+    async def delivery_count(self, kind: str, since: datetime, until: datetime) -> int:
+        """Сколько доставок указанного вида попало в интервал [since, until)."""
+        row = await self._db.fetchone(
+            "SELECT COUNT(*) AS n FROM deliveries WHERE kind = ? AND sent_at >= ? AND sent_at < ?",
+            (kind, to_iso(since), to_iso(until)),
+        )
+        return int(row["n"]) if row is not None else 0
+
+    async def last_signals(self, limit: int, pair_key: str, prompt_version: str) -> list[dict]:
+        """Последние сигналы consensus текущей пары, свежие первыми."""
+        return await self._db.fetchall(
+            "SELECT ticker, direction, horizon_days, expected_change_pct, confidence, created_at "
+            "FROM predictions WHERE model = 'consensus' AND is_issued = 1 AND pair_key = ? "
+            "AND prompt_version = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (pair_key, prompt_version, limit),
+        )
+
+    async def pending_cluster_count(self) -> int:
+        """Сколько кластеров ещё ждут анализа."""
+        row = await self._db.fetchone(
+            "SELECT COUNT(*) AS n FROM clusters WHERE status = 'pending'"
+        )
+        return int(row["n"]) if row is not None else 0
+
+    async def ticker_success_counts(
+        self, pair_key: str, prompt_version: str, limit: int
+    ) -> list[dict]:
+        """Точность consensus по тикерам: самые частые тикеры с проверенными прогнозами."""
+        return await self._db.fetchall(
+            "SELECT ticker, COUNT(*) AS n, COALESCE(SUM(is_successful), 0) AS ok FROM predictions "
+            "WHERE model = 'consensus' AND is_issued = 1 AND evaluated_at IS NOT NULL "
+            "AND is_successful IS NOT NULL AND pair_key = ? AND prompt_version = ? "
+            "GROUP BY ticker ORDER BY n DESC, ticker LIMIT ?",
+            (pair_key, prompt_version, limit),
+        )
+
+    async def recent_fatal_run(self, since: datetime) -> dict | None:
+        """Последний фатальный сбой LLM (401/402/403) не раньше since."""
+        return await self._db.fetchone(
+            "SELECT model, created_at FROM model_runs WHERE status = 'fatal' "
+            "AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (to_iso(since),),
+        )
+
     async def kv_get(self, key: str) -> str | None:
         """Значение ключа из kv или None, если ключа нет."""
         row = await self._db.fetchone("SELECT value FROM kv WHERE key = ?", (key,))
@@ -406,6 +499,10 @@ class Repository:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+    async def kv_delete(self, key: str) -> None:
+        """Удалить ключ из kv (сброс флага состояния); отсутствие ключа не ошибка."""
+        await self._db.execute("DELETE FROM kv WHERE key = ?", (key,))
 
     async def spent_since(self, since_utc: datetime) -> float:
         """Сумма model_runs.cost_usd за запросы не раньше since_utc (UTC)."""
@@ -451,8 +548,8 @@ class Repository:
             window,
         )
         deliveries = await self._db.fetchone(
-            "SELECT COALESCE(SUM(status = 'alert'), 0) AS alerts, "
-            "COALESCE(SUM(status = 'digest'), 0) AS digest FROM deliveries "
+            "SELECT COALESCE(SUM(kind = 'alert'), 0) AS alerts, "
+            "COALESCE(SUM(kind = 'digest'), 0) AS digest FROM deliveries "
             "WHERE sent_at >= ? AND sent_at < ?",
             window,
         )
