@@ -1,0 +1,9 @@
+{
+  "marketdata": {
+    "columns": ["SECID", "LAST", "CURRENTVALUE"],
+    "data": [
+      ["SBER", 250.5, null],
+      ["IMOEX", null, 3100.0]
+    ]
+  }
+}
